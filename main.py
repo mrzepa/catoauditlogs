@@ -3,10 +3,12 @@ import sys
 import json
 import time
 import logging
-import datetime
 from typing import Any, Dict, Tuple, Optional
 import requests
 from dotenv import load_dotenv
+import argparse
+from datetime import datetime, timezone
+import pandas as pd
 
 # Initialize logging
 logging.basicConfig(
@@ -100,27 +102,125 @@ def construct_query(account_id: str, timeframe: str, marker: str) -> str:
     Returns:
         str: The constructed GraphQL query.
     """
-    return f'''
-    {{
-        auditFeed(accountIDs: ["{account_id}"] timeFrame: "{timeframe}" marker: "{marker}") {{
-            marker
-            fetchedCount
-            hasMore
-            accounts {{
-                id
-                records {{
-                    time
-                    fieldsMap
-                }}
-            }}
-        }}
-    }}
-    '''
+    return '''
+{
+	auditFeed(accountIDs:[''' + account_id + '''] timeFrame:"''' + timeframe + '''" marker:"''' + marker + '''") {
+		marker
+		fetchedCount
+		hasMore
+		accounts {
+			id
+			records {
+				time
+				fieldsMap
+			}
+		}
+	}
+}'''
+
+
+def convert_timestamp(ms_timestamp: str) -> str:
+    """
+    Convert a timestamp in milliseconds to a human-readable UTC datetime string.
+
+    Args:
+        ms_timestamp (str): Timestamp in milliseconds as a string.
+
+    Returns:
+        str: Human-readable datetime string in UTC, formatted as 'YYYY-MM-DD HH:MM:SS'.
+    """
+    try:
+        # Convert string to integer
+        ms = int(ms_timestamp)
+        # Convert milliseconds to seconds
+        s = ms / 1000
+        # Create timezone-aware datetime object in UTC
+        dt = datetime.fromtimestamp(s, timezone.utc)
+        # Format datetime
+        return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+    except Exception as e:
+        logger.error(f"Error converting timestamp {ms_timestamp}: {e}")
+        return ms_timestamp  # Return original if conversion fails
+
+
+def unflatten_dict(d: Dict[str, Any], sep: str = '.') -> Dict[str, Any]:
+    """
+    Reconstruct nested dictionaries from flat dictionaries with dot-separated keys.
+
+    Args:
+        d (Dict[str, Any]): The flat dictionary.
+        sep (str): Separator used in keys.
+
+    Returns:
+        Dict[str, Any]: The reconstructed nested dictionary.
+    """
+    result = {}
+    for key, value in d.items():
+        parts = key.split(sep)
+        current = result
+        for part in parts[:-1]:
+            if part not in current:
+                current[part] = {}
+            current = current[part]
+        current[parts[-1]] = value
+    return result
+
+
+def generate_log_summary(log: Dict[str, Any]) -> str:
+    """
+    Generate a human-readable summary of a log entry.
+
+    Args:
+        log (Dict[str, Any]): The log entry as a dictionary.
+
+    Returns:
+        str: A formatted string summarizing the log.
+    """
+    # Convert timestamps
+    creation_date = convert_timestamp(log.get('creation_date', ''))
+    insertion_date = convert_timestamp(log.get('insertion_date', ''))
+    event_timestamp = log.get('event_timestamp', '')
+
+    # Reconstruct nested fields
+    nested_log = unflatten_dict(log)
+
+    # Extract key information
+    admin = nested_log.get('admin', 'Unknown Admin')
+    admin_id = nested_log.get('admin_id', 'Unknown ID')
+    change_type = nested_log.get('change_type', 'Unknown Change Type')
+    model_type = nested_log.get('model_type', 'Unknown Model Type')
+    model_name = nested_log.get('model_name', 'Unknown Model Name')
+    module = nested_log.get('module', 'Unknown Module')
+
+    # Start building the summary
+    summary = f"**Event Timestamp:** {event_timestamp}\n"
+    summary += f"**Admin:** {admin} (ID: {admin_id})\n"
+    summary += f"**Change Type:** {change_type}\n"
+    summary += f"**Model Type:** {model_type}\n"
+    summary += f"**Model Name:** {model_name}\n"
+    summary += f"**Module:** {module}\n"
+    summary += f"**Creation Date:** {creation_date}\n"
+    summary += f"**Insertion Date:** {insertion_date}\n"
+
+    # Add details about changes
+    change_after = nested_log.get('change', {}).get('After', {})
+    change_before = nested_log.get('change', {}).get('Before', {})
+
+    if change_after:
+        summary += "**Changes After:**\n"
+        summary += json.dumps(change_after, indent=4) + "\n"
+    if change_before:
+        summary += "**Changes Before:**\n"
+        summary += json.dumps(change_before, indent=4) + "\n"
+
+    summary += "-" * 50 + "\n"
+
+    return summary
 
 
 def save_logs_to_file(logs: list, output_file: str) -> None:
     """
-    Save the audit logs to a JSON file.
+    Save the audit logs as a human-readable text file.
 
     Args:
         logs (list): The list of audit log records.
@@ -128,33 +228,64 @@ def save_logs_to_file(logs: list, output_file: str) -> None:
     """
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(logs, f, indent=4, ensure_ascii=False)
+            for log in logs:
+                summary = generate_log_summary(log)
+                f.write(summary)
         logger.info("Successfully saved %d logs to %s.", len(logs), output_file)
     except IOError as e:
         logger.error("Failed to save logs to file: %s", e)
 
 
+def save_logs_to_csv(logs: list, output_file: str) -> None:
+    """
+    Save the audit logs to a CSV file.
+
+    Args:
+        logs (list): The list of audit log records.
+        output_file (str): The filename to save the logs.
+    """
+    # Convert logs to pandas DataFrame
+    df = pd.DataFrame(logs)
+
+    # Convert timestamp fields
+    if 'creation_date' in df.columns:
+        df['creation_date'] = df['creation_date'].apply(convert_timestamp)
+    if 'insertion_date' in df.columns:
+        df['insertion_date'] = df['insertion_date'].apply(convert_timestamp)
+    if 'event_timestamp' in df.columns:
+        # Optionally, format event_timestamp
+        df['event_timestamp'] = pd.to_datetime(df['event_timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    try:
+        df.to_csv(output_file, index=False)
+        logger.info("Successfully saved %d logs to %s.", len(logs), output_file)
+    except IOError as e:
+        logger.error("Failed to save logs to CSV file: %s", e)
+
+
 def fetch_audit_logs(
-    api_key: str,
-    account_id: str,
-    timeframe: str = "PT5D",
-    output_file: Optional[str] = None
+        api_key: str,
+        account_id: str,
+        timeframe: str = "P2D",
+        output_file: Optional[str] = None,
+        save_as_csv: bool = False
 ) -> None:
     """
-    Fetch audit logs from the Cato Networks API and save them to a file.
+    Fetch audit logs from the Cato Networks API and save them to a readable file.
 
     Args:
         api_key (str): The API key for authentication.
         account_id (str): The account ID to fetch audit logs for.
-        timeframe (str, optional): The timeframe for the logs. Defaults to "PT5D".
+        timeframe (str, optional): The timeframe for the logs. Defaults to "P2D".
         output_file (Optional[str], optional): The file to save the logs. If None, prints to console.
+        save_as_csv (bool, optional): Whether to save the logs as CSV. Defaults to False.
     """
     total_count = 0
     api_call_count = 0
     iteration = 1
     marker = ""
     all_logs = []
-    start_time = datetime.datetime.now()
+    start_time = datetime.now()
 
     while True:
         query = construct_query(account_id, timeframe, marker)
@@ -193,45 +324,70 @@ def fetch_audit_logs(
 
         iteration += 1
 
-    end_time = datetime.datetime.now()
+    end_time = datetime.now()
     logger.info(
         "Completed fetching %d events using %d API calls in %s.",
         total_count, api_call_count, end_time - start_time
     )
 
     if output_file:
-        save_logs_to_file(all_logs, output_file)
+        if save_as_csv:
+            save_logs_to_csv(all_logs, output_file)
+        else:
+            save_logs_to_file(all_logs, output_file)
     else:
         # Print to console if no output file is specified
         for log_entry in all_logs:
-            print(json.dumps(log_entry, indent=2, ensure_ascii=False))
+            summary = generate_log_summary(log_entry)
+            print(summary)
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace: The parsed arguments.
+    """
+    parser = argparse.ArgumentParser(description="Fetch and format audit logs from Cato Networks API.")
+    parser.add_argument('--api_key', type=str, help='Cato Networks API key.')
+    parser.add_argument('--account_id', type=str, help='Account ID to fetch audit logs for.')
+    parser.add_argument('--output_file', type=str, help='File to save the audit logs.')
+    parser.add_argument('--timeframe', type=str, default='last.P2D', help='Timeframe for audit logs (e.g., last.P2D for 2 days).')
+    parser.add_argument('--save_as_csv', action='store_true', help='Save logs as CSV instead of text.')
+    return parser.parse_args()
 
 
 def main():
     """
     Main function to execute the audit log fetching process.
     """
-    api_key = os.getenv('API_KEY')
-    account_id = os.getenv('ACCOUNT_ID')
-    output_file = os.getenv('OUTPUT_FILE')  # Optional: specify via .env or environment variables
-    timeframe = os.getenv('TIMEFRAME', 'PT5D')  # Optional: specify via .env or environment variables
+    args = parse_arguments()
+
+    api_key = args.api_key or os.getenv('API_KEY')
+    account_id = args.account_id or os.getenv('ACCOUNT_ID')
+    output_file = args.output_file or os.getenv('OUTPUT_FILE')
+    timeframe = args.timeframe
+
+    save_as_csv = args.save_as_csv or os.getenv('SAVE_AS_CSV', 'False').lower() in ['true', '1', 'yes']
 
     # Validate essential configurations
     if not api_key:
-        logger.critical("API_KEY not found in environment variables.")
+        logger.critical("API_KEY not found. Provide it via --api_key or in the .env file.")
         sys.exit(1)
     if not account_id:
-        logger.critical("ACCOUNT_ID not found in environment variables.")
+        logger.critical("ACCOUNT_ID not found. Provide it via --account_id or in the .env file.")
         sys.exit(1)
 
     # Log the configurations being used
-    logger.debug("Configurations - API_KEY: %s, ACCOUNT_ID: %s, OUTPUT_FILE: %s, TIMEFRAME: %s",
+    logger.debug("Configurations - API_KEY: %s, ACCOUNT_ID: %s, OUTPUT_FILE: %s, TIMEFRAME: %s, SAVE_AS_CSV: %s",
                  '***' if api_key else None,
                  account_id,
                  output_file,
-                 timeframe)
+                 timeframe,
+                 save_as_csv)
 
-    fetch_audit_logs(api_key, account_id, timeframe=timeframe, output_file=output_file)
+    fetch_audit_logs(api_key, account_id, timeframe=timeframe, output_file=output_file, save_as_csv=save_as_csv)
 
 
 if __name__ == "__main__":
