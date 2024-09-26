@@ -66,7 +66,6 @@ Copy code
 API_KEY=your_cato_api_key
 ACCOUNT_ID=your_account_id
 OUTPUT_FILE=readable_audit_logs.txt  # Or readable_audit_logs.csv
-TIMEFRAME=P2D  # ISO8601 duration for 2 days (e.g., P1D for 1 day)
 SAVE_AS_CSV=False  # Set to True to save as CSV
 ```
 **Variable Descriptions:**
